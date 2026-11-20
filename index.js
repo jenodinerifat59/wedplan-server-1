@@ -100,6 +100,64 @@ app.get('/services/:id', async (req, res) => {
   }
 });
 
+app.post('/services', async (req, res) => {
+  try {
+    const serviceData = req.body;
+
+    const result = await servicesCollection.insertOne({
+      ...serviceData,
+      status: 'pending',
+      createdAt: new Date()
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Service created successfully',
+      data: result
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+});
+app.patch('/services/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updateData = req.body;
+
+    const result = await servicesCollection.updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $set: {
+          ...updateData,
+          updatedAt: new Date()
+        }
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Service not found'
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Service updated successfully'
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+});
+
 // Start Server
 app.listen(port, () => {
   console.log(`WedPlan Server Running on port ${port}`);
