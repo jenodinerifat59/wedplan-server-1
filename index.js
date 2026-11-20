@@ -3,12 +3,100 @@ import express from 'express';
 import cors from 'cors';
 import 'dotenv/config';
 import { MongoClient, ObjectId } from 'mongodb';
+import Stripe from 'stripe';
+
+
 const app = express();
 const port = process.env.PORT || 5000;
 
 // Middleware
 app.use(cors());
+app.post(
+  '/webhook',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    const signature = req.headers['stripe-signature'];
+
+    let event;
+
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        signature,
+        process.env.STRIPE_WEBHOOK_SECRET
+      );
+    } catch (error) {
+      console.error('Webhook Signature Error:', error.message);
+
+      return res.status(400).send(`Webhook Error: ${error.message}`);
+    }
+
+    try {
+      if (event.type === 'checkout.session.completed') {
+        const session = event.data.object;
+
+        if (
+          session.mode === 'subscription' &&
+          session.payment_status === 'paid'
+        ) {
+          const vendorEmail = session.metadata?.vendorEmail;
+
+          if (!vendorEmail) {
+            return res.status(400).json({
+              success: false,
+              message: 'Vendor email missing from metadata'
+            });
+          }
+
+          // Activate Premium Plan
+          await db.collection('user').updateOne(
+            { email: vendorEmail },
+            {
+              $set: {
+                subscriptionPlan: 'premium',
+                subscriptionExpiresAt: null
+              }
+            }
+          );
+
+          // Save Transaction
+          await transactionsCollection.updateOne(
+            { stripeEventId: event.id },
+            {
+              $setOnInsert: {
+                stripeEventId: event.id,
+                vendorEmail,
+                sessionId: session.id,
+                subscriptionId: session.subscription,
+                amountTotal: session.amount_total,
+                currency: session.currency,
+                status: 'completed',
+                createdAt: new Date()
+              }
+            },
+            { upsert: true }
+          );
+
+          console.log('Vendor Premium Activated:', vendorEmail);
+        }
+      }
+
+      res.status(200).json({
+        received: true
+      });
+
+    } catch (error) {
+      console.error('Webhook Processing Error:', error);
+
+      res.status(500).json({
+        success: false,
+        message: 'Webhook processing failed'
+      });
+    }
+  }
+);
 app.use(express.json());
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 // MongoDB Connection
 const client = new MongoClient(process.env.MONGODB_URI);
@@ -388,6 +476,60 @@ app.get('/transactions', async (req, res) => {
     });
   }
 });
+// create checkout session for subscription
+
+
+app.post('/create-checkout-session', async (req, res) => {
+  try {
+    const { vendorEmail } = req.body;
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      mode: 'subscription',
+
+      metadata: {
+        vendorEmail: vendorEmail
+      },
+
+      subscription_data: {
+        metadata: {
+          vendorEmail: vendorEmail
+        }
+      },
+
+      line_items: [
+        {
+          price_data: {
+            currency: 'usd',
+            product_data: {
+              name: 'WedPlan Premium Plan'
+            },
+            unit_amount: 1000,
+            recurring: {
+              interval: 'month'
+            }
+          },
+          quantity: 1
+        }
+      ],
+
+      success_url: `${process.env.CLIENT_URL}/payment-success`,
+      cancel_url: `${process.env.CLIENT_URL}/payment-cancel`
+    });
+
+    res.status(200).json({
+      success: true,
+      checkoutUrl: session.url
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+});
+
 
 // Start Server
 app.listen(port, () => {
