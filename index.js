@@ -186,6 +186,55 @@ app.delete('/services/:id', async (req, res) => {
   }
 });
 
+//boking api
+
+app.post('/bookings', async (req, res) => {
+  try {
+    const bookingData = req.body;
+
+    const newBooking = {
+      ...bookingData,
+      status: 'pending',
+      createdAt: new Date()
+    };
+
+    const result = await bookingsCollection.insertOne(newBooking);
+
+    res.status(201).json({
+      success: true,
+      message: 'Booking request submitted successfully',
+      data: result
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+});
+
+app.get('/bookings', async (req, res) => {
+  try {
+    const bookings = await bookingsCollection
+      .find()
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).json({
+      success: true,
+      total: bookings.length,
+      data: bookings
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+});
+
 // Start Server
 app.listen(port, () => {
   console.log(`WedPlan Server Running on port ${port}`);
