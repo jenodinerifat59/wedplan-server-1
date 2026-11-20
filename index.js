@@ -321,6 +321,74 @@ app.patch('/bookings/:id/status', async (req, res) => {
   }
 });
 
+//bookin cancellation
+app.patch('/bookings/:id/cancel', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid Booking ID'
+      });
+    }
+
+    const result = await bookingsCollection.updateOne(
+      {
+        _id: new ObjectId(id),
+        status: 'pending'
+      },
+      {
+        $set: {
+          status: 'cancelled',
+          updatedAt: new Date()
+        }
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Pending booking not found'
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Booking cancelled successfully'
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+});
+
+
+// Transaction API
+app.get('/transactions', async (req, res) => {
+  try {
+    const transactions = await transactionsCollection
+      .find()
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).json({
+      success: true,
+      total: transactions.length,
+      data: transactions
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+});
+
 // Start Server
 app.listen(port, () => {
   console.log(`WedPlan Server Running on port ${port}`);
