@@ -88,30 +88,78 @@ async function withVendors(services) {
   return services.map((s) => ({ ...s, vendor: map.get(String(s.vendorId)) || null }));
 }
 
+
 async function withBookingDetails(bookings) {
-  const sIds = [...new Set(bookings.map((b) => String(b.serviceId)))].map((i) => new ObjectId(i));
+  if (!bookings.length) return [];
+
+  const sIds = [
+    ...new Set(bookings.map((b) => String(b.serviceId))),
+  ]
+    .filter((id) => ObjectId.isValid(id))
+    .map((id) => new ObjectId(id));
+
   const uIds = [
-    ...new Set(bookings.flatMap((b) => [String(b.vendorId), String(b.customerId)])),
-  ].map((i) => new ObjectId(i));
-  const services = await (await col("services")).find({ _id: { $in: sIds } }).toArray();
-  const users = await (await col(USERS_COLLECTION)).find({ _id: { $in: uIds } }).toArray();
-  const sMap = new Map(services.map((s) => [String(s._id), s]));
-  const uMap = new Map(users.map((u) => [String(u._id), u]));
+    ...new Set(
+      bookings.flatMap((b) => [
+        String(b.vendorId),
+        String(b.customerId),
+      ])
+    ),
+  ]
+    .filter((id) => ObjectId.isValid(id))
+    .map((id) => new ObjectId(id));
+
+const [services, users] = await Promise.all([
+  (async () =>
+    (await col("services"))
+      .find({ _id: { $in: sIds } })
+      .toArray())(),
+
+  (async () =>
+    (await col(USERS_COLLECTION))
+      .find({ _id: { $in: uIds } })
+      .toArray())(),
+]);
+
+  const sMap = new Map(
+    services.map((s) => [String(s._id), s])
+  );
+
+  const uMap = new Map(
+    users.map((u) => [String(u._id), u])
+  );
+
   return bookings.map((b) => {
-    const s = sMap.get(String(b.serviceId));
+    const service = sMap.get(String(b.serviceId));
+    const customer = uMap.get(String(b.customerId));
+    const vendor = uMap.get(String(b.vendorId));
+
     return {
       ...b,
-      service: s && { _id: s._id, serviceName: s.serviceName, images: s.images, price: s.price },
-      vendor: publicVendor(uMap.get(String(b.vendorId))),
-      customer: uMap.get(String(b.customerId)) && {
-        _id: b.customerId,
-        name: uMap.get(String(b.customerId)).name,
-        email: uMap.get(String(b.customerId)).email,
-        image: uMap.get(String(b.customerId)).image,
-      },
+
+      service: service
+        ? {
+            _id: service._id,
+            serviceName: service.serviceName,
+            images: service.images,
+            price: service.price,
+          }
+        : null,
+
+      customer: customer
+        ? {
+            _id: customer._id,
+            name: customer.name,
+            email: customer.email,
+            image: customer.image,
+          }
+        : null,
+
+      vendor: vendor ? publicVendor(vendor) : null,
     };
   });
 }
+
 
 /* ------------------------- Stripe webhook (raw body) ------------------------- */
 const periodEnd = (sub) => {
@@ -789,6 +837,23 @@ app.patch("/api/customer/bookings/:id/cancel", ...customerOnly, async (req, res)
   fail(res, 409, "Only pending bookings can be cancelled");
 });
 
+
+app.get("/api/vendor/recent-bookings", ...vendorOnly, async (req, res) => {
+  try {
+    const bookings = await col("bookings");
+
+    const list = await bookings
+      .find({ vendorId: req.user._id })
+      .sort({ createdAt: -1 })
+      .limit(5)
+      .toArray();
+
+    res.json(await withBookingDetails(list));
+  } catch (error) {
+    console.error("Recent bookings error:", error);
+    fail(res, 500, "Failed to load recent bookings");
+  }
+});
 /* ------------------------------ Admin ------------------------------ */
 const adminOnly = [verifyJWT, requireRole("admin")];
 
