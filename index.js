@@ -30,7 +30,7 @@ const CATEGORIES = [
   "Makeup & Styling",
   "Wedding Fashion",
 ];
-const FREE_LIMIT = 3;
+const FREE_LIMIT = 300;
 
 const stripe = new Stripe(STRIPE_SECRET_KEY);
 const app = express();
@@ -620,6 +620,138 @@ app.post("/api/bookings", verifyJWT, async (req, res) => {
   });
   res.status(201).json({ message: "Booking request submitted", _id: r.insertedId });
 });
+
+app.get("/api/vendor/bookings", verifyJWT, async (req, res) => {
+  try {
+    if (req.user.role !== "vendor") {
+      return fail(res, 403, "Only vendors can view bookings");
+    }
+
+    const bookings = await (await col("bookings"))
+      .aggregate([
+        {
+          $match: {
+            vendorId: req.user._id,
+          },
+        },
+        {
+          $sort: {
+            createdAt: -1,
+          },
+        },
+        {
+          $lookup: {
+            from: "services",
+            localField: "serviceId",
+            foreignField: "_id",
+            as: "service",
+          },
+        },
+        {
+          $unwind: {
+            path: "$service",
+            preserveNullAndEmptyArrays: true,
+          },
+        },
+        {
+          $lookup: {
+            from: "users",
+            localField: "customerId",
+            foreignField: "_id",
+            as: "customer",
+          },
+        },
+        {
+          $unwind: {
+            path: "$customer",
+            preserveNullAndEmptyArrays: true,
+          },
+        },
+      ])
+      .toArray();
+
+    res.json({
+      success: true,
+      bookings,
+    });
+  } catch (error) {
+    console.error("Vendor bookings error:", error);
+    fail(res, 500, "Failed to fetch vendor bookings");
+  }
+});
+
+
+app.get("/api/bookings/my-bookings", verifyJWT, async (req, res) => {
+  try {
+    if (req.user.role !== "customer") {
+      return fail(res, 403, "Only customers can view their bookings");
+    }
+
+    const bookings = await (await col("bookings"))
+      .find({
+        customerEmail: req.user.email,
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.json({
+      success: true,
+      bookings,
+    });
+  } catch (error) {
+    console.error("My bookings error:", error);
+    fail(res, 500, "Failed to fetch bookings");
+  }
+});
+
+app.patch("/api/bookings/:id/status", verifyJWT, async (req, res) => {
+  try {
+    // Only vendors can update booking status
+    if (req.user.role !== "vendor") {
+      return fail(res, 403, "Only vendors can update booking status");
+    }
+
+    const bookingId = oid(req.params.id);
+    const status = str(req.body.status);
+
+    if (!bookingId) {
+      return fail(res, 400, "Invalid booking ID");
+    }
+
+    if (!["accepted", "rejected"].includes(status)) {
+      return fail(res, 400, "Invalid booking status");
+    }
+
+    const bookings = await col("bookings");
+
+    const result = await bookings.updateOne(
+      {
+        _id: bookingId,
+        vendorId: req.user._id,
+        status: "pending",
+      },
+      {
+        $set: {
+          status,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return fail(res, 404, "Pending booking not found");
+    }
+
+    res.json({
+      success: true,
+      message: `Booking ${status} successfully`,
+    });
+  } catch (error) {
+    console.error("Update booking status error:", error);
+    fail(res, 500, "Failed to update booking status");
+  }
+});
+
 
 const customerOnly = [verifyJWT, requireRole("customer")];
 
