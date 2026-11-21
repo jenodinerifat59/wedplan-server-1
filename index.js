@@ -82,8 +82,8 @@ const publicVendor = (u) =>
   };
 
 async function withVendors(services) {
-  const ids = [...new Set(services.map((s) => String(s.vendorId)))].map((i) => new ObjectId(i));
-  const users = await (await col(USERS_COLLECTION)).find({ _id: { $in: ids } }).toArray();
+  const vendorIds = [...new Set(services.map((s) => String(s.vendorId)))];
+  const users = await (await col(USERS_COLLECTION)).find({ _id: { $in: vendorIds } }).toArray();
   const map = new Map(users.map((u) => [String(u._id), publicVendor(u)]));
   return services.map((s) => ({ ...s, vendor: map.get(String(s.vendorId)) || null }));
 }
@@ -151,6 +151,17 @@ async function saveTransaction({ vendorId, amount, currency, id, subId, status }
   );
 }
 
+// When Premium ends, keep the 3 oldest active services and deactivate the rest
+async function enforceFreeLimit(vendorId) {
+  const services = await col("services");
+  const active = await services
+    .find({ vendorId, isActive: true, status: { $ne: "rejected" } })
+    .sort({ createdAt: 1 })
+    .toArray();
+  const extra = active.slice(FREE_LIMIT).map((s) => s._id);
+  if (extra.length) await services.updateMany({ _id: { $in: extra } }, { $set: { isActive: false } });
+}
+
 const invoiceSubId = (inv) =>
   inv.parent?.subscription_details?.subscription ?? inv.subscription ?? null;
 
@@ -208,10 +219,11 @@ async function handleStripeEvent(event) {
       break;
     }
     case "customer.subscription.deleted": {
-      await (await col(USERS_COLLECTION)).updateOne(
+      const vendor = await (await col(USERS_COLLECTION)).findOneAndUpdate(
         { stripeSubscriptionId: obj.id },
         { $set: { subscriptionPlan: "free", subscriptionExpiresAt: null } }
       );
+      if (vendor) await enforceFreeLimit(vendor._id);
       break;
     }
     default:
@@ -249,23 +261,63 @@ app.use(async (req, res, next) => {
 
 const JWKS = createRemoteJWKSet(new URL(`${BETTER_AUTH_URL}/api/auth/jwks`));
 
+
 const verifyJWT = async (req, res, next) => {
   const header = req.headers.authorization || "";
-  if (!header.startsWith("Bearer ")) return fail(res, 401, "Authentication token missing");
-  let payload;
+
+  if (!header.startsWith("Bearer ")) {
+    return fail(res, 401, "Authentication token missing");
+  }
+
   try {
-    ({ payload } = await jwtVerify(header.slice(7), JWKS, { issuer: BETTER_AUTH_URL }));
-  } catch {
+    const { payload } = await jwtVerify(
+      header.slice(7),
+      JWKS,
+      { issuer: BETTER_AUTH_URL }
+    );
+
+    const sub = payload.sub ?? payload.id;
+    console.log("JWT User ID:", sub);
+console.log("User Collection:", USERS_COLLECTION);
+
+    if (!sub) {
+      return fail(res, 401, "User ID missing from token");
+    }
+
+    const conditions = [
+      { id: sub },
+      { _id: sub },
+    ];
+
+    if (oid(sub)) {
+      conditions.push({ _id: oid(sub) });
+    }
+
+    const userCollection = await col(USERS_COLLECTION);
+
+    const user = await userCollection.findOne({
+      $or: conditions,
+    });
+
+    console.log("JWT User ID:", sub);
+    console.log("User Collection:", USERS_COLLECTION);
+    console.log("User Found:", !!user);
+
+    if (!user) {
+      return fail(res, 401, "User not found");
+    }
+
+    if (user.isBlocked) {
+      return fail(res, 403, "Your account has been blocked");
+    }
+
+    req.user = user;
+    next();
+
+  } catch (error) {
+    console.error("JWT Verification Error:", error);
     return fail(res, 401, "Invalid or expired token");
   }
-  const sub = payload.sub ?? payload.id;
-  const conditions = [{ id: sub }];
-  if (oid(sub)) conditions.push({ _id: oid(sub) });
-  const user = await (await col(USERS_COLLECTION)).findOne({ $or: conditions });
-  if (!user) return fail(res, 401, "User not found");
-  if (user.isBlocked) return fail(res, 403, "Your account has been blocked");
-  req.user = user; // role & block status always come from the DB, never from the client
-  next();
 };
 
 const requireRole = (...roles) => (req, res, next) =>
@@ -324,6 +376,11 @@ app.get("/api/categories", async (req, res) => {
     .toArray();
   const map = new Map(counts.map((c) => [c._id, c.count]));
   res.json(CATEGORIES.map((name) => ({ name, count: map.get(name) || 0 })));
+});
+
+app.get("/api/locations", async (req, res) => {
+  const locations = await (await col("services")).distinct("location", { status: "approved", isActive: true });
+  res.json(locations.sort());
 });
 
 app.get("/api/services/featured", async (req, res) => {
@@ -411,6 +468,14 @@ app.get("/api/vendor/overview", ...vendorOnly, async (req, res) => {
 
 app.get("/api/vendor/services", ...vendorOnly, async (req, res) => {
   res.json(await (await col("services")).find({ vendorId: req.user._id }).sort({ createdAt: -1 }).toArray());
+});
+
+app.get("/api/vendor/services/:id", ...vendorOnly, async (req, res) => {
+  const id = oid(req.params.id);
+  if (!id) return fail(res, 400, "Invalid service ID");
+  const s = await (await col("services")).findOne({ _id: id, vendorId: req.user._id });
+  if (!s) return fail(res, 404, "Service not found");
+  res.json(s);
 });
 
 app.post("/api/vendor/services", ...vendorOnly, async (req, res) => {
@@ -522,7 +587,7 @@ app.post("/api/payments/cancel-subscription", ...vendorOnly, async (req, res) =>
 });
 
 /* ------------------------------ Bookings / Customer ------------------------------ */
-app.post("/api/bookings", verifyJWT, requireRole("customer", "vendor"), async (req, res) => {
+app.post("/api/bookings", verifyJWT, async (req, res) => {
   const serviceId = oid(req.body.serviceId);
   const eventDate = new Date(req.body.eventDate);
   const eventLocation = str(req.body.eventLocation);
@@ -532,6 +597,7 @@ app.post("/api/bookings", verifyJWT, requireRole("customer", "vendor"), async (r
   const service = await (await col("services")).findOne({ _id: serviceId, status: "approved", isActive: true });
   if (!service) return fail(res, 404, "Service not found or unavailable");
   if (String(service.vendorId) === String(req.user._id)) return fail(res, 403, "You cannot book your own service");
+  if (req.user.role !== "customer") return fail(res, 403, "Only customers can submit booking requests");
   const bookings = await col("bookings");
   const dayStart = new Date(eventDate); dayStart.setUTCHours(0, 0, 0, 0);
   const dayEnd = new Date(dayStart); dayEnd.setUTCDate(dayEnd.getUTCDate() + 1);
@@ -555,7 +621,7 @@ app.post("/api/bookings", verifyJWT, requireRole("customer", "vendor"), async (r
   res.status(201).json({ message: "Booking request submitted", _id: r.insertedId });
 });
 
-const customerOnly = [verifyJWT, requireRole("customer", "vendor")];
+const customerOnly = [verifyJWT, requireRole("customer")];
 
 app.get("/api/customer/overview", ...customerOnly, async (req, res) => {
   const b = await col("bookings");
@@ -567,6 +633,14 @@ app.get("/api/customer/overview", ...customerOnly, async (req, res) => {
 app.get("/api/customer/bookings", ...customerOnly, async (req, res) => {
   const list = await (await col("bookings")).find({ customerId: req.user._id }).sort({ createdAt: -1 }).toArray();
   res.json(await withBookingDetails(list));
+});
+
+app.get("/api/customer/bookings/:id", ...customerOnly, async (req, res) => {
+  const id = oid(req.params.id);
+  if (!id) return fail(res, 400, "Invalid booking ID");
+  const b = await (await col("bookings")).findOne({ _id: id, customerId: req.user._id });
+  if (!b) return fail(res, 404, "Booking not found");
+  res.json((await withBookingDetails([b]))[0]);
 });
 
 app.patch("/api/customer/bookings/:id/cancel", ...customerOnly, async (req, res) => {
