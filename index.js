@@ -938,6 +938,54 @@ app.get("/api/admin/transactions", ...adminOnly, async (req, res) => {
   res.json(list.map((t) => ({ ...t, vendor: map.get(String(t.vendorId)) || null })));
 });
 
+app.get("/api/admin/bookings", ...adminOnly, async (req, res) => {
+  try {
+    const { status, q } = req.query;
+
+    const filter = {};
+
+    if (status) {
+      filter.status = String(status);
+    }
+
+    const list = await (await col("bookings"))
+      .find(filter)
+      .sort({ createdAt: -1 })
+      .limit(500)
+      .toArray();
+
+    const bookings = await withBookingDetails(list);
+
+    if (q) {
+      const search = String(q).toLowerCase();
+
+      const filtered = bookings.filter((booking) => {
+        const customerName = booking.customer?.name || "";
+        const customerEmail = booking.customer?.email || "";
+        const vendorName = booking.vendor?.name || "";
+        const serviceName = booking.service?.serviceName || "";
+
+        return [
+          customerName,
+          customerEmail,
+          vendorName,
+          serviceName,
+          String(booking._id),
+        ].some((value) =>
+          value.toLowerCase().includes(search)
+        );
+      });
+
+      return res.json(filtered);
+    }
+
+    res.json(bookings);
+  } catch (error) {
+    console.error("Admin bookings error:", error);
+    fail(res, 500, "Failed to load bookings");
+  }
+});
+
 /* ------------------------------ Errors ------------------------------ */
 app.use((req, res) => fail(res, 404, "Route not found"));
 
