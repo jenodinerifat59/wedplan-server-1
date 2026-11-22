@@ -180,20 +180,44 @@ async function activatePremium(vendorId, sub) {
   );
 }
 
-async function saveTransaction({ vendorId, amount, currency, id, subId, status }) {
+async function saveTransaction({
+  vendorId,
+  customerId,
+  bookingId,
+  amount,
+  currency,
+  id,
+  subId,
+  status,
+  type = "subscription",
+}) {
+  const transaction = {
+    type,
+    amount,
+    currency: String(currency || "").toLowerCase(),
+    stripeSessionId: id,
+    status,
+    createdAt: new Date(),
+  };
+
+  // Vendor subscription payment
+  if (vendorId) {
+    transaction.vendorId = new ObjectId(vendorId);
+    transaction.plan = "premium";
+    transaction.stripeSubscriptionId = subId || null;
+  }
+
+  // Customer booking payment
+  if (customerId) {
+    transaction.customerId = new ObjectId(customerId);
+    transaction.bookingId = new ObjectId(bookingId);
+    transaction.plan = "booking";
+  }
+
   await (await col("transactions")).updateOne(
     { stripeSessionId: id },
     {
-      $setOnInsert: {
-        vendorId: new ObjectId(vendorId),
-        plan: "premium",
-        amount,
-        currency,
-        stripeSessionId: id,
-        stripeSubscriptionId: subId,
-        status,
-        createdAt: new Date(),
-      },
+      $setOnInsert: transaction,
     },
     { upsert: true }
   );
@@ -213,32 +237,123 @@ async function enforceFreeLimit(vendorId) {
 const invoiceSubId = (inv) =>
   inv.parent?.subscription_details?.subscription ?? inv.subscription ?? null;
 
+
 async function handleStripeEvent(event) {
   const obj = event.data.object;
+
   switch (event.type) {
     case "checkout.session.completed": {
-      if (obj.mode !== "subscription" || obj.payment_status !== "paid") break;
-      const sub = await stripe.subscriptions.retrieve(obj.subscription);
-      const vendorId = obj.metadata?.vendorId;
-      if (!vendorId) break;
-      await saveTransaction({
-        vendorId,
-        amount: obj.amount_total / 100,
-        currency: obj.currency,
-        id: obj.id,
-        subId: sub.id,
-        status: "paid",
-      });
-      await activatePremium(vendorId, sub);
+      // VENDOR PREMIUM SUBSCRIPTION PAYMENT
+      if (obj.mode === "subscription" && obj.payment_status === "paid") {
+        const sub = await stripe.subscriptions.retrieve(obj.subscription);
+        const vendorId = obj.metadata?.vendorId;
+
+        if (!vendorId) break;
+
+        await saveTransaction({
+          vendorId,
+          amount: obj.amount_total / 100,
+          currency: obj.currency,
+          id: obj.id,
+          subId: sub.id,
+          status: "paid",
+          type: "subscription",
+        });
+
+        await activatePremium(vendorId, sub);
+        break;
+      }
+
+      // CUSTOMER FULL BOOKING PAYMENT
+      if (obj.mode === "payment" && obj.payment_status === "paid") {
+        const bookingId = oid(obj.metadata?.bookingId);
+        const customerId = oid(obj.metadata?.customerId);
+
+        if (!bookingId || !customerId) {
+          throw new Error("Invalid booking payment metadata");
+        }
+
+        const bookings = await col("bookings");
+
+        const booking = await bookings.findOne({
+          _id: bookingId,
+          customerId,
+          stripeSessionId: obj.id,
+        });
+
+        if (!booking) {
+          throw new Error("Booking not found for Stripe session");
+        }
+
+        // Verify amount and currency against database values.
+        const expectedAmount = Math.round(
+          Number(booking.paymentAmount) * 100
+        );
+
+        if (
+          !Number.isFinite(expectedAmount) ||
+          obj.amount_total !== expectedAmount ||
+          obj.currency !== "bdt"
+        ) {
+          throw new Error("Booking payment amount or currency mismatch");
+        }
+
+        // Update booking only once.
+        const updateResult = await bookings.updateOne(
+          {
+            _id: bookingId,
+            stripeSessionId: obj.id,
+            paymentStatus: { $ne: "paid" },
+          },
+          {
+            $set: {
+              paymentStatus: "paid",
+              paymentStatusUpdatedAt: new Date(),
+              status: "pending",
+              stripePaymentIntentId: obj.payment_intent || null,
+            },
+          }
+        );
+
+        // Save customer transaction idempotently.
+        await saveTransaction({
+          customerId: String(customerId),
+          bookingId: String(bookingId),
+          amount: obj.amount_total / 100,
+          currency: obj.currency,
+          id: obj.id,
+          status: "paid",
+          type: "booking",
+        });
+
+        // Notify admin only on the first successful update.
+        if (updateResult.modifiedCount > 0) {
+          await createAdminNotification({
+            type: "payment",
+            title: "Booking Payment Received",
+            message: `Full payment received for ${booking.serviceId}.`,
+            relatedId: bookingId,
+          });
+        }
+
+        break;
+      }
+
       break;
     }
+
+    // VENDOR SUBSCRIPTION RENEWAL
     case "invoice.paid": {
-      if (obj.billing_reason !== "subscription_cycle") break; // first payment handled above
+      if (obj.billing_reason !== "subscription_cycle") break;
+
       const subId = invoiceSubId(obj);
       if (!subId) break;
+
       const sub = await stripe.subscriptions.retrieve(subId);
       const vendorId = sub.metadata?.vendorId;
+
       if (!vendorId) break;
+
       await saveTransaction({
         vendorId,
         amount: obj.amount_paid / 100,
@@ -246,16 +361,23 @@ async function handleStripeEvent(event) {
         id: obj.id,
         subId,
         status: "paid",
+        type: "subscription",
       });
+
       await activatePremium(vendorId, sub);
       break;
     }
+
+    // VENDOR SUBSCRIPTION PAYMENT FAILED
     case "invoice.payment_failed": {
       const subId = invoiceSubId(obj);
       if (!subId) break;
+
       const sub = await stripe.subscriptions.retrieve(subId);
       const vendorId = sub.metadata?.vendorId;
+
       if (!vendorId) break;
+
       await saveTransaction({
         vendorId,
         amount: obj.amount_due / 100,
@@ -263,21 +385,38 @@ async function handleStripeEvent(event) {
         id: obj.id,
         subId,
         status: "failed",
+        type: "subscription",
       });
+
       break;
     }
+
+    // VENDOR SUBSCRIPTION CANCELLED
     case "customer.subscription.deleted": {
-      const vendor = await (await col(USERS_COLLECTION)).findOneAndUpdate(
+      const vendor = await (
+        await col(USERS_COLLECTION)
+      ).findOneAndUpdate(
         { stripeSubscriptionId: obj.id },
-        { $set: { subscriptionPlan: "free", subscriptionExpiresAt: null } }
+        {
+          $set: {
+            subscriptionPlan: "free",
+            subscriptionExpiresAt: null,
+          },
+        }
       );
-      if (vendor) await enforceFreeLimit(vendor._id);
+
+      if (vendor) {
+        await enforceFreeLimit(vendor._id);
+      }
+
       break;
     }
+
     default:
       break;
   }
 }
+
 
 app.post("/api/webhooks/stripe", express.raw({ type: "application/json" }), async (req, res) => {
   let event;
@@ -643,54 +782,155 @@ app.post("/api/payments/cancel-subscription", ...vendorOnly, async (req, res) =>
 });
 
 /* ------------------------------ Bookings / Customer ------------------------------ */
+
+
 app.post("/api/bookings", verifyJWT, async (req, res) => {
-  const serviceId = oid(req.body.serviceId);
-  const eventDate = new Date(req.body.eventDate);
-  const eventLocation = str(req.body.eventLocation);
-  if (!serviceId) return fail(res, 400, "Invalid service ID");
-  if (isNaN(eventDate) || eventDate <= new Date()) return fail(res, 400, "Event date must be a future date");
-  if (eventLocation.length < 2) return fail(res, 400, "Event location is required");
-  const service = await (await col("services")).findOne({ _id: serviceId, status: "approved", isActive: true });
-  if (!service) return fail(res, 404, "Service not found or unavailable");
-  if (String(service.vendorId) === String(req.user._id)) return fail(res, 403, "You cannot book your own service");
-  if (req.user.role !== "customer") return fail(res, 403, "Only customers can submit booking requests");
-  const bookings = await col("bookings");
-  const dayStart = new Date(eventDate); dayStart.setUTCHours(0, 0, 0, 0);
-  const dayEnd = new Date(dayStart); dayEnd.setUTCDate(dayEnd.getUTCDate() + 1);
-  const dup = await bookings.findOne({
-    serviceId,
-    customerId: req.user._id,
-    eventDate: { $gte: dayStart, $lt: dayEnd },
-    status: { $in: ["pending", "accepted"] },
-  });
-  if (dup) return fail(res, 409, "You already have an active request for this service on that date");
-  
-const r = await bookings.insertOne({
-  serviceId,
-  vendorId: service.vendorId,
-  customerId: req.user._id,
-  eventDate,
-  eventLocation,
-  message: str(req.body.message),
-  status: "pending",
-  createdAt: new Date(),
+  try {
+    const serviceId = oid(req.body.serviceId);
+    const eventDate = new Date(req.body.eventDate);
+    const eventLocation = str(req.body.eventLocation);
+
+    if (!serviceId) return fail(res, 400, "Invalid service ID");
+
+    if (isNaN(eventDate) || eventDate <= new Date()) {
+      return fail(res, 400, "Event date must be a future date");
+    }
+
+    if (eventLocation.length < 2) {
+      return fail(res, 400, "Event location is required");
+    }
+
+    if (req.user.role !== "customer") {
+      return fail(res, 403, "Only customers can submit booking requests");
+    }
+
+    const service = await (await col("services")).findOne({
+      _id: serviceId,
+      status: "approved",
+      isActive: true,
+    });
+
+    if (!service) {
+      return fail(res, 404, "Service not found or unavailable");
+    }
+
+    if (String(service.vendorId) === String(req.user._id)) {
+      return fail(res, 403, "You cannot book your own service");
+    }
+
+    const amount = Number(service.price);
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return fail(res, 400, "Invalid service price");
+    }
+
+    const bookings = await col("bookings");
+
+    const dayStart = new Date(eventDate);
+    dayStart.setUTCHours(0, 0, 0, 0);
+
+    const dayEnd = new Date(dayStart);
+    dayEnd.setUTCDate(dayEnd.getUTCDate() + 1);
+
+    const dup = await bookings.findOne({
+      serviceId,
+      customerId: req.user._id,
+      eventDate: { $gte: dayStart, $lt: dayEnd },
+      status: { $in: ["pending", "accepted", "confirmed"] },
+    });
+
+    if (dup) {
+      return fail(
+        res,
+        409,
+        "You already have an active request for this service on that date"
+      );
+    }
+
+    const bookingResult = await bookings.insertOne({
+      serviceId,
+      vendorId: service.vendorId,
+      customerId: req.user._id,
+      eventDate,
+      eventLocation,
+      message: str(req.body.message),
+
+      status: "pending",
+      paymentStatus: "unpaid",
+      paymentAmount: amount,
+      currency: "bdt",
+
+      createdAt: new Date(),
+    });
+
+    const bookingId = String(bookingResult.insertedId);
+
+    try {
+      const session = await stripe.checkout.sessions.create({
+        mode: "payment",
+        customer_email: req.user.email,
+        client_reference_id: bookingId,
+
+        line_items: [
+          {
+            quantity: 1,
+            price_data: {
+              currency: "bdt",
+              unit_amount: Math.round(amount * 100),
+              product_data: {
+                name: service.serviceName,
+                description: "WedPlan Booking Full Payment",
+              },
+            },
+          },
+        ],
+
+        metadata: {
+          type: "booking_payment",
+          bookingId,
+          serviceId: String(serviceId),
+          vendorId: String(service.vendorId),
+          customerId: String(req.user._id),
+        },
+
+        payment_intent_data: {
+          metadata: {
+            type: "booking_payment",
+            bookingId,
+          },
+        },
+
+        success_url: `${CLIENT}/booking/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${CLIENT}/booking/payment/cancel?booking_id=${bookingId}`,
+      });
+
+      await bookings.updateOne(
+        { _id: bookingResult.insertedId },
+        {
+          $set: {
+            stripeSessionId: session.id,
+            checkoutUrl: session.url,
+          },
+        }
+      );
+
+      return res.status(201).json({
+        message: "Continue to payment",
+        bookingId,
+        url: session.url,
+      });
+    } catch (paymentError) {
+      await bookings.deleteOne({ _id: bookingResult.insertedId });
+
+      console.error("Booking checkout error:", paymentError);
+      return fail(res, 500, "Unable to create payment session");
+    }
+  } catch (error) {
+    console.error("Booking creation error:", error);
+    return fail(res, 500, "Failed to create booking");
+  }
 });
 
-// Create Admin Notification
-await createAdminNotification({
-  type: "booking",
-  title: "New Booking Request",
-  message: `${req.user.name || "A customer"} requested ${service.serviceName}.`,
-  relatedId: r.insertedId,
-});
-
-res.status(201).json({
-  message: "Booking request submitted",
-  _id: r.insertedId,
-});
-
-  res.status(201).json({ message: "Booking request submitted", _id: r.insertedId });
-});
 
 app.get("/api/vendor/bookings", verifyJWT, async (req, res) => {
   try {
