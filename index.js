@@ -1047,6 +1047,84 @@ app.get("/api/admin/services", ...adminOnly, async (req, res) => {
   res.json(await withVendors(items));
 });
 
+/* ------------------------- Admin Service Actions ------------------------- */
+
+// Approve / Reject Service
+app.patch("/api/admin/services/:id/status", ...adminOnly, async (req, res) => {
+  try {
+    const id = oid(req.params.id);
+    const { status } = req.body;
+
+    if (!id) return fail(res, 400, "Invalid service ID");
+
+    if (!["approved", "rejected"].includes(status)) {
+      return fail(res, 400, "Status must be approved or rejected");
+    }
+
+    const services = await col("services");
+
+    const result = await services.updateOne(
+      { _id: id },
+      {
+        $set: {
+          status,
+          reviewedAt: new Date(),
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (!result.matchedCount) {
+      return fail(res, 404, "Service not found");
+    }
+
+    res.json({
+      message: `Service ${status} successfully`,
+    });
+  } catch (error) {
+    console.error("Update service status error:", error);
+    fail(res, 500, "Failed to update service status");
+  }
+});
+
+// Activate / Deactivate Service
+app.patch("/api/admin/services/:id/active", ...adminOnly, async (req, res) => {
+  try {
+    const id = oid(req.params.id);
+    const { isActive } = req.body;
+
+    if (!id) return fail(res, 400, "Invalid service ID");
+
+    if (typeof isActive !== "boolean") {
+      return fail(res, 400, "isActive must be true or false");
+    }
+
+    const services = await col("services");
+
+    const result = await services.updateOne(
+      { _id: id },
+      {
+        $set: {
+          isActive,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (!result.matchedCount) {
+      return fail(res, 404, "Service not found");
+    }
+
+    res.json({
+      message: `Service ${isActive ? "activated" : "deactivated"} successfully`,
+    });
+  } catch (error) {
+    console.error("Update service active status error:", error);
+    fail(res, 500, "Failed to update service active status");
+  }
+});
+
+
 app.patch("/api/admin/services/:id/status", ...adminOnly, async (req, res) => {
   const id = oid(req.params.id);
   if (!id) return fail(res, 400, "Invalid service ID");
