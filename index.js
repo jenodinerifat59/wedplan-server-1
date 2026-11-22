@@ -539,6 +539,14 @@ app.post("/api/vendor/services", ...vendorOnly, async (req, res) => {
     createdAt: new Date(),
   };
   const r = await (await col("services")).insertOne(doc);
+
+await createAdminNotification({
+  type: "service",
+  title: "New Service Submitted",
+  message: `${req.user.name || "A vendor"} submitted ${doc.serviceName} for approval.`,
+  relatedId: r.insertedId,
+});
+
   res.status(201).json({ message: "Service submitted for approval", _id: r.insertedId });
 });
 
@@ -656,16 +664,31 @@ app.post("/api/bookings", verifyJWT, async (req, res) => {
     status: { $in: ["pending", "accepted"] },
   });
   if (dup) return fail(res, 409, "You already have an active request for this service on that date");
-  const r = await bookings.insertOne({
-    serviceId,
-    vendorId: service.vendorId,
-    customerId: req.user._id,
-    eventDate,
-    eventLocation,
-    message: str(req.body.message),
-    status: "pending",
-    createdAt: new Date(),
-  });
+  
+const r = await bookings.insertOne({
+  serviceId,
+  vendorId: service.vendorId,
+  customerId: req.user._id,
+  eventDate,
+  eventLocation,
+  message: str(req.body.message),
+  status: "pending",
+  createdAt: new Date(),
+});
+
+// Create Admin Notification
+await createAdminNotification({
+  type: "booking",
+  title: "New Booking Request",
+  message: `${req.user.name || "A customer"} requested ${service.serviceName}.`,
+  relatedId: r.insertedId,
+});
+
+res.status(201).json({
+  message: "Booking request submitted",
+  _id: r.insertedId,
+});
+
   res.status(201).json({ message: "Booking request submitted", _id: r.insertedId });
 });
 
@@ -857,6 +880,118 @@ app.get("/api/vendor/recent-bookings", ...vendorOnly, async (req, res) => {
 /* ------------------------------ Admin ------------------------------ */
 const adminOnly = [verifyJWT, requireRole("admin")];
 
+/* ------------------------- Admin Notifications APIs ------------------------- */
+
+// Get all notifications
+app.get("/api/admin/notifications", ...adminOnly, async (req, res) => {
+  try {
+    const notificationsCollection = await col("notifications");
+
+    const [notifications, unreadCount] = await Promise.all([
+      notificationsCollection
+        .find()
+        .sort({ createdAt: -1 })
+        .limit(200)
+        .toArray(),
+
+      notificationsCollection.countDocuments({
+        isRead: false,
+      }),
+    ]);
+
+    res.json({
+      notifications,
+      unreadCount,
+    });
+  } catch (error) {
+    console.error("Get notifications error:", error);
+    fail(res, 500, "Failed to load notifications");
+  }
+});
+
+// Mark one notification as read
+app.patch(
+  "/api/admin/notifications/:id/read",
+  ...adminOnly,
+  async (req, res) => {
+    try {
+      const id = oid(req.params.id);
+
+      if (!id) return fail(res, 400, "Invalid notification ID");
+
+      const result = await (await col("notifications")).updateOne(
+        { _id: id },
+        {
+          $set: {
+            isRead: true,
+            readAt: new Date(),
+          },
+        }
+      );
+
+      if (!result.matchedCount) {
+        return fail(res, 404, "Notification not found");
+      }
+
+      res.json({ message: "Notification marked as read" });
+    } catch (error) {
+      console.error("Read notification error:", error);
+      fail(res, 500, "Failed to update notification");
+    }
+  }
+);
+
+// Mark all notifications as read
+app.patch(
+  "/api/admin/notifications/read-all",
+  ...adminOnly,
+  async (req, res) => {
+    try {
+      await (await col("notifications")).updateMany(
+        { isRead: false },
+        {
+          $set: {
+            isRead: true,
+            readAt: new Date(),
+          },
+        }
+      );
+
+      res.json({ message: "All notifications marked as read" });
+    } catch (error) {
+      console.error("Read all notifications error:", error);
+      fail(res, 500, "Failed to update notifications");
+    }
+  }
+);
+
+// Delete one notification
+app.delete(
+  "/api/admin/notifications/:id",
+  ...adminOnly,
+  async (req, res) => {
+    try {
+      const id = oid(req.params.id);
+
+      if (!id) return fail(res, 400, "Invalid notification ID");
+
+      const result = await (await col("notifications")).deleteOne({
+        _id: id,
+      });
+
+      if (!result.deletedCount) {
+        return fail(res, 404, "Notification not found");
+      }
+
+      res.json({ message: "Notification deleted successfully" });
+    } catch (error) {
+      console.error("Delete notification error:", error);
+      fail(res, 500, "Failed to delete notification");
+    }
+  }
+);
+
+
 app.get("/api/admin/overview", ...adminOnly, async (req, res) => {
   const users = await col(USERS_COLLECTION);
   const services = await col("services");
@@ -1040,6 +1175,28 @@ app.patch("/api/admin/settings", ...adminOnly, async (req, res) => {
   }
 });
 
+
+/* ------------------------- Notification Helper ------------------------- */
+
+const createAdminNotification = async ({
+  type,
+  title,
+  message,
+  relatedId = null,
+}) => {
+  try {
+    await (await col("notifications")).insertOne({
+      type,
+      title,
+      message,
+      relatedId,
+      isRead: false,
+      createdAt: new Date(),
+    });
+  } catch (error) {
+    console.error("Notification creation error:", error);
+  }
+};
 
 /* ------------------------------ Errors ------------------------------ */
 app.use((req, res) => fail(res, 404, "Route not found"));
