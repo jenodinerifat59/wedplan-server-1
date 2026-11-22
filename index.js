@@ -986,6 +986,61 @@ app.get("/api/admin/bookings", ...adminOnly, async (req, res) => {
   }
 });
 
+// Admin Platform Settings
+
+app.get("/api/admin/settings", ...adminOnly, async (req, res) => {
+  try {
+    const settings = await (await col("platformSettings")).findOne({
+      _id: "platform",
+    });
+
+    res.json(
+      settings || {
+        name: "WedPlan",
+        email: "",
+        phone: "",
+        address: "",
+      }
+    );
+  } catch (error) {
+    console.error("Get platform settings error:", error);
+    fail(res, 500, "Failed to load platform settings");
+  }
+});
+
+app.patch("/api/admin/settings", ...adminOnly, async (req, res) => {
+  try {
+    const { name, email, phone, address } = req.body;
+
+    const settings = {
+      name: str(name),
+      email: str(email),
+      phone: str(phone),
+      address: str(address),
+      updatedAt: new Date(),
+    };
+
+    if (settings.name.length < 2) {
+      return fail(res, 400, "Platform name is required");
+    }
+
+    await (await col("platformSettings")).updateOne(
+      { _id: "platform" },
+      { $set: settings },
+      { upsert: true }
+    );
+
+    res.json({
+      message: "Platform settings updated successfully",
+      settings,
+    });
+  } catch (error) {
+    console.error("Update platform settings error:", error);
+    fail(res, 500, "Failed to update platform settings");
+  }
+});
+
+
 /* ------------------------------ Errors ------------------------------ */
 app.use((req, res) => fail(res, 404, "Route not found"));
 
