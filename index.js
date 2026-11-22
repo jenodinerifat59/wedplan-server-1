@@ -30,7 +30,7 @@ const CATEGORIES = [
   "Makeup & Styling",
   "Wedding Fashion",
 ];
-const FREE_LIMIT = 300;
+const FREE_LIMIT = 3;
 
 const stripe = new Stripe(STRIPE_SECRET_KEY);
 const app = express();
@@ -197,17 +197,15 @@ async function saveTransaction({
     currency: String(currency || "").toLowerCase(),
     stripeSessionId: id,
     status,
-    createdAt: new Date(),
+    updatedAt: new Date(),
   };
 
-  // Vendor subscription payment
   if (vendorId) {
     transaction.vendorId = new ObjectId(vendorId);
     transaction.plan = "premium";
     transaction.stripeSubscriptionId = subId || null;
   }
 
-  // Customer booking payment
   if (customerId) {
     transaction.customerId = new ObjectId(customerId);
     transaction.bookingId = new ObjectId(bookingId);
@@ -217,7 +215,10 @@ async function saveTransaction({
   await (await col("transactions")).updateOne(
     { stripeSessionId: id },
     {
-      $setOnInsert: transaction,
+      $set: transaction,
+      $setOnInsert: {
+        createdAt: new Date(),
+      },
     },
     { upsert: true }
   );
@@ -238,17 +239,42 @@ const invoiceSubId = (inv) =>
   inv.parent?.subscription_details?.subscription ?? inv.subscription ?? null;
 
 
+
+
+
+
 async function handleStripeEvent(event) {
   const obj = event.data.object;
 
+  console.log("\n========== STRIPE WEBHOOK ==========");
+  console.log("Event:", event.type);
+  console.log("Session ID:", obj.id);
+  console.log("Mode:", obj.mode);
+  console.log("Payment Status:", obj.payment_status);
+  console.log("Currency:", obj.currency);
+  console.log("Metadata:", obj.metadata);
+
   switch (event.type) {
-    case "checkout.session.completed": {
-      // VENDOR PREMIUM SUBSCRIPTION PAYMENT
-      if (obj.mode === "subscription" && obj.payment_status === "paid") {
-        const sub = await stripe.subscriptions.retrieve(obj.subscription);
+    case "checkout.session.completed":
+    case "checkout.session.async_payment_succeeded": {
+      // VENDOR PREMIUM SUBSCRIPTION
+      if (obj.mode === "subscription") {
+        if (obj.payment_status !== "paid") {
+          console.log("Subscription payment not completed.");
+          break;
+        }
+
         const vendorId = obj.metadata?.vendorId;
 
-        if (!vendorId) break;
+        if (!oid(vendorId)) {
+          throw new Error("Invalid vendor ID in Stripe metadata");
+        }
+
+        const sub = await stripe.subscriptions.retrieve(
+          typeof obj.subscription === "string"
+            ? obj.subscription
+            : obj.subscription.id
+        );
 
         await saveTransaction({
           vendorId,
@@ -261,47 +287,76 @@ async function handleStripeEvent(event) {
         });
 
         await activatePremium(vendorId, sub);
+
+        console.log("Premium activated:", vendorId);
         break;
       }
 
-      // CUSTOMER FULL BOOKING PAYMENT
-      if (obj.mode === "payment" && obj.payment_status === "paid") {
-        const bookingId = oid(obj.metadata?.bookingId);
-        const customerId = oid(obj.metadata?.customerId);
+      // CUSTOMER BOOKING PAYMENT
+      if (obj.mode === "payment") {
+        if (obj.payment_status !== "paid") {
+          console.log("Booking payment is not paid yet.");
+          break;
+        }
 
-        if (!bookingId || !customerId) {
+        if (obj.metadata?.type !== "booking_payment") {
+          console.log("Not a WedPlan booking payment. Skipping.");
+          break;
+        }
+
+        const bookingId = obj.metadata?.bookingId;
+        const customerId = obj.metadata?.customerId;
+        const serviceId = obj.metadata?.serviceId;
+        const vendorId = obj.metadata?.vendorId;
+
+        if (
+          !oid(bookingId) ||
+          !oid(customerId) ||
+          !oid(serviceId) ||
+          !oid(vendorId)
+        ) {
           throw new Error("Invalid booking payment metadata");
         }
 
         const bookings = await col("bookings");
 
         const booking = await bookings.findOne({
-          _id: bookingId,
-          customerId,
+          _id: new ObjectId(bookingId),
           stripeSessionId: obj.id,
         });
 
+        console.log("Booking Found:", !!booking);
+
         if (!booking) {
-          throw new Error("Booking not found for Stripe session");
+          throw new Error(
+            `Booking not found for Stripe session: ${obj.id}`
+          );
         }
 
-        // Verify amount and currency against database values.
+        const validBooking =
+          String(booking.customerId) === String(customerId) &&
+          String(booking.serviceId) === String(serviceId) &&
+          String(booking.vendorId) === String(vendorId);
+
+        if (!validBooking) {
+          throw new Error("Booking metadata does not match database");
+        }
+
         const expectedAmount = Math.round(
           Number(booking.paymentAmount) * 100
         );
 
         if (
-          !Number.isFinite(expectedAmount) ||
-          obj.amount_total !== expectedAmount ||
-          obj.currency !== "bdt"
+          !Number.isSafeInteger(expectedAmount) ||
+          Number(obj.amount_total) !== expectedAmount ||
+          String(obj.currency).toLowerCase() !== "bdt"
         ) {
-          throw new Error("Booking payment amount or currency mismatch");
+          throw new Error("Booking amount or currency mismatch");
         }
 
-        // Update booking only once.
         const updateResult = await bookings.updateOne(
           {
-            _id: bookingId,
+            _id: booking._id,
             stripeSessionId: obj.id,
             paymentStatus: { $ne: "paid" },
           },
@@ -309,33 +364,52 @@ async function handleStripeEvent(event) {
             $set: {
               paymentStatus: "paid",
               paymentStatusUpdatedAt: new Date(),
-              status: "pending",
-              stripePaymentIntentId: obj.payment_intent || null,
+              stripePaymentIntentId:
+                typeof obj.payment_intent === "string"
+                  ? obj.payment_intent
+                  : obj.payment_intent?.id || null,
+              updatedAt: new Date(),
             },
           }
         );
 
-        // Save customer transaction idempotently.
+        console.log("Booking Update:", {
+          matchedCount: updateResult.matchedCount,
+          modifiedCount: updateResult.modifiedCount,
+        });
+
+        // DEBUG LOGS
+        console.log("========== BOOKING PAYMENT DEBUG ==========");
+        console.log("Session ID:", obj.id);
+        console.log("Booking ID:", bookingId);
+        console.log("Booking Found:", !!booking);
+        console.log("Stored Session ID:", booking?.stripeSessionId);
+        console.log("Expected Amount:", expectedAmount);
+        console.log("Stripe Amount:", obj.amount_total);
+        console.log("Payment Status:", obj.payment_status);
+        console.log("Update Result:", updateResult);
+
+        // SAVE TRANSACTION
         await saveTransaction({
-          customerId: String(customerId),
-          bookingId: String(bookingId),
-          amount: obj.amount_total / 100,
+          customerId: String(booking.customerId),
+          bookingId: String(booking._id),
+          amount: Number(obj.amount_total) / 100,
           currency: obj.currency,
           id: obj.id,
           status: "paid",
           type: "booking",
         });
 
-        // Notify admin only on the first successful update.
         if (updateResult.modifiedCount > 0) {
           await createAdminNotification({
             type: "payment",
             title: "Booking Payment Received",
-            message: `Full payment received for ${booking.serviceId}.`,
-            relatedId: bookingId,
+            message: `Full payment received for booking ${booking._id}.`,
+            relatedId: booking._id,
           });
         }
 
+        console.log("BOOKING PAYMENT PROCESSED:", booking._id);
         break;
       }
 
@@ -352,7 +426,7 @@ async function handleStripeEvent(event) {
       const sub = await stripe.subscriptions.retrieve(subId);
       const vendorId = sub.metadata?.vendorId;
 
-      if (!vendorId) break;
+      if (!oid(vendorId)) break;
 
       await saveTransaction({
         vendorId,
@@ -376,7 +450,7 @@ async function handleStripeEvent(event) {
       const sub = await stripe.subscriptions.retrieve(subId);
       const vendorId = sub.metadata?.vendorId;
 
-      if (!vendorId) break;
+      if (!oid(vendorId)) break;
 
       await saveTransaction({
         vendorId,
@@ -402,7 +476,8 @@ async function handleStripeEvent(event) {
             subscriptionPlan: "free",
             subscriptionExpiresAt: null,
           },
-        }
+        },
+        { returnDocument: "after" }
       );
 
       if (vendor) {
@@ -413,29 +488,42 @@ async function handleStripeEvent(event) {
     }
 
     default:
+      console.log("Unhandled Stripe event:", event.type);
       break;
   }
 }
 
 
+
+console.log("✅ STRIPE WEBHOOK ROUTE REGISTERED");
 app.post("/api/webhooks/stripe", express.raw({ type: "application/json" }), async (req, res) => {
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(
-      req.body,
-      req.headers["stripe-signature"],
-      STRIPE_WEBHOOK_SECRET
-    );
-  } catch (err) {
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-  try {
-    await handleStripeEvent(event);
-    res.json({ received: true });
-  } catch (err) {
-    console.error("Webhook handler failed:", err);
-    res.status(500).json({ received: false });
-  }
+ console.log("🔥 STRIPE WEBHOOK HIT");
+
+let event;
+
+try {
+  event = stripe.webhooks.constructEvent(
+    req.body,
+    req.headers["stripe-signature"],
+    STRIPE_WEBHOOK_SECRET
+  );
+} catch (err) {
+  return res.status(400).send(`Webhook Error: ${err.message}`);
+}
+
+try {
+  console.log("Stripe Event Received:", event.type);
+  console.log("Stripe Session Metadata:", event.data.object.metadata);
+  console.log("Stripe Session ID:", event.data.object.id);
+
+  await handleStripeEvent(event);
+
+  res.json({ received: true });
+} catch (err) {
+  console.error("Webhook handler failed:", err);
+  res.status(500).json({ received: false });
+}
+
 });
 
 /* ------------------------------ Middleware ------------------------------ */
@@ -766,14 +854,117 @@ app.post("/api/payments/create-checkout-session", ...vendorOnly, async (req, res
 });
 
 // Read-only: tells the success page whether the *webhook* has already activated premium
-app.get("/api/payments/session/:sessionId", ...vendorOnly, async (req, res) => {
-  const t = await (await col("transactions")).findOne({
-    stripeSessionId: req.params.sessionId,
-    vendorId: req.user._id,
-  });
-  if (!t) return res.json({ status: "processing" });
-  res.json({ status: t.status, amount: t.amount, currency: t.currency, plan: t.plan });
-});
+
+app.get(
+  "/api/payments/session/:sessionId",
+  ...vendorOnly,
+  async (req, res) => {
+    try {
+      const sessionId = req.params.sessionId;
+      const vendorId = req.user._id;
+
+      // Find transaction in database
+      const transactions = await col("transactions");
+
+      let transaction = await transactions.findOne({
+        stripeSessionId: sessionId,
+        vendorId,
+      });
+
+      // If transaction already exists
+      if (transaction) {
+        return res.json({
+          status: transaction.status,
+          amount: transaction.amount,
+          currency: transaction.currency,
+          plan: transaction.plan,
+        });
+      }
+
+      // Verify directly with Stripe
+      const session = await stripe.checkout.sessions.retrieve(
+        sessionId
+      );
+
+      // Check session owner
+      if (session.metadata?.vendorId !== String(vendorId)) {
+        return res.status(403).json({
+          message: "This payment session does not belong to you.",
+        });
+      }
+
+      // Check subscription mode
+      if (session.mode !== "subscription") {
+        return res.json({
+          status: "failed",
+          message: "Invalid subscription session.",
+        });
+      }
+
+      // Payment is not completed yet
+      if (session.payment_status !== "paid") {
+        return res.json({
+          status: session.status === "expired"
+            ? "expired"
+            : "processing",
+        });
+      }
+
+      // Retrieve Stripe subscription
+      const subscriptionId = session.subscription;
+
+      if (!subscriptionId) {
+        return res.json({
+          status: "processing",
+        });
+      }
+
+      const subscription = await stripe.subscriptions.retrieve(
+        subscriptionId
+      );
+
+      // Save successful transaction
+      await transactions.updateOne(
+        {
+          stripeSessionId: session.id,
+        },
+        {
+          $set: {
+            vendorId,
+            stripeSessionId: session.id,
+            stripeSubscriptionId: subscription.id,
+            amount: (session.amount_total || 0) / 100,
+            currency: session.currency,
+            plan: "premium",
+            status: "paid",
+            updatedAt: new Date(),
+          },
+          $setOnInsert: {
+            createdAt: new Date(),
+          },
+        },
+        { upsert: true }
+      );
+
+      // Activate premium
+      await activatePremium(String(vendorId), subscription);
+
+      return res.json({
+        status: "paid",
+        amount: (session.amount_total || 0) / 100,
+        currency: session.currency,
+        plan: "premium",
+      });
+    } catch (error) {
+      console.error("Payment Session Verification Error:", error);
+
+      return res.status(500).json({
+        message: "Unable to verify payment.",
+      });
+    }
+  }
+);
+
 
 app.post("/api/payments/cancel-subscription", ...vendorOnly, async (req, res) => {
   if (!req.user.stripeSubscriptionId) return fail(res, 400, "No active subscription");
@@ -1065,6 +1256,109 @@ app.patch("/api/bookings/:id/status", verifyJWT, async (req, res) => {
 
 
 const customerOnly = [verifyJWT, requireRole("customer")];
+
+
+
+app.get(
+  "/api/customer/payments/session/:sessionId",
+  ...customerOnly,
+  async (req, res) => {
+    try {
+      const sessionId = str(req.params.sessionId);
+
+      if (!sessionId) {
+        return fail(res, 400, "Payment session ID is required");
+      }
+
+      // 1. Stripe থেকে আসল Checkout Session যাচাই
+      const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+      // 2. Payment সত্যিই successful কি না
+      if (
+        session.mode !== "payment" ||
+        session.payment_status !== "paid" ||
+        session.metadata?.type !== "booking_payment"
+      ) {
+        return res.json({ status: "processing" });
+      }
+
+      const bookingId = session.metadata?.bookingId;
+
+      if (!oid(bookingId)) {
+        return fail(res, 400, "Invalid booking information");
+      }
+
+      // 3. Database থেকে Booking খুঁজে বের করা
+      const bookings = await col("bookings");
+
+      const booking = await bookings.findOne({
+        _id: new ObjectId(bookingId),
+        customerId: req.user._id,
+        stripeSessionId: session.id,
+      });
+
+      if (!booking) {
+        return fail(res, 404, "Booking not found");
+      }
+
+      // 4. Amount এবং currency যাচাই
+      const expectedAmount = Math.round(
+        Number(booking.paymentAmount) * 100
+      );
+
+      if (
+        Number(session.amount_total) !== expectedAmount ||
+        String(session.currency).toLowerCase() !== "bdt"
+      ) {
+        return fail(res, 400, "Payment amount verification failed");
+      }
+
+      // 5. Booking paid update
+      await bookings.updateOne(
+        {
+          _id: booking._id,
+          customerId: req.user._id,
+          stripeSessionId: session.id,
+        },
+        {
+          $set: {
+            paymentStatus: "paid",
+            paymentStatusUpdatedAt: new Date(),
+            stripePaymentIntentId:
+              typeof session.payment_intent === "string"
+                ? session.payment_intent
+                : session.payment_intent?.id || null,
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      // 6. Transaction তৈরি বা আপডেট
+      await saveTransaction({
+        customerId: String(booking.customerId),
+        bookingId: String(booking._id),
+        amount: Number(session.amount_total) / 100,
+        currency: session.currency,
+        id: session.id,
+        status: "paid",
+        type: "booking",
+      });
+
+      return res.json({
+        status: "paid",
+        bookingId: String(booking._id),
+        amount: Number(session.amount_total) / 100,
+        currency: session.currency,
+      });
+
+    } catch (error) {
+      console.error("Payment verification error:", error);
+      return fail(res, 500, "Payment verification failed");
+    }
+  }
+);
+
+
 
 app.get("/api/customer/overview", ...customerOnly, async (req, res) => {
   const b = await col("bookings");
