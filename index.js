@@ -992,19 +992,58 @@ app.delete(
 );
 
 
+
 app.get("/api/admin/overview", ...adminOnly, async (req, res) => {
-  const users = await col(USERS_COLLECTION);
-  const services = await col("services");
-  const [totalUsers, vendors, customers, totalServices, pendingServices, transactions] = await Promise.all([
-    users.countDocuments(),
-    users.countDocuments({ role: "vendor" }),
-    users.countDocuments({ role: "customer" }),
-    services.countDocuments(),
-    services.countDocuments({ status: "pending" }),
-    (await col("transactions")).countDocuments(),
-  ]);
-  res.json({ totalUsers, vendors, customers, totalServices, pendingServices, transactions });
+  try {
+    const users = await col(USERS_COLLECTION);
+    const services = await col("services");
+    const bookings = await col("bookings");
+    const transactionsCollection = await col("transactions");
+
+    const [
+      totalUsers,
+      vendors,
+      customers,
+      totalServices,
+      pendingServices,
+      transactions,
+      totalBookings,
+      paidTransactions,
+    ] = await Promise.all([
+      users.countDocuments(),
+      users.countDocuments({ role: "vendor" }),
+      users.countDocuments({ role: "customer" }),
+      services.countDocuments(),
+      services.countDocuments({ status: "pending" }),
+      transactionsCollection.countDocuments(),
+      bookings.countDocuments(),
+      transactionsCollection
+        .find({ status: "paid" })
+        .toArray(),
+    ]);
+
+    const totalRevenue = paidTransactions.reduce(
+      (total, transaction) =>
+        total + Number(transaction.amount || 0),
+      0
+    );
+
+    res.json({
+      totalUsers,
+      vendors,
+      customers,
+      totalServices,
+      pendingServices,
+      transactions,
+      totalBookings,
+      totalRevenue,
+    });
+  } catch (error) {
+    console.error("Admin overview error:", error);
+    fail(res, 500, "Failed to load admin overview");
+  }
 });
+
 
 app.get("/api/admin/users", ...adminOnly, async (req, res) => {
   const { q, role } = req.query;
@@ -1198,6 +1237,58 @@ app.get("/api/admin/bookings", ...adminOnly, async (req, res) => {
     fail(res, 500, "Failed to load bookings");
   }
 });
+
+/* ------------------------- Admin Booking Status Update ------------------------- */
+
+app.patch(
+  "/api/admin/bookings/:id/status",
+  ...adminOnly,
+  async (req, res) => {
+    try {
+      const id = oid(req.params.id);
+      const { status } = req.body;
+
+      if (!id) {
+        return fail(res, 400, "Invalid booking ID");
+      }
+
+      const allowedStatuses = [
+        "pending",
+        "confirmed",
+        "completed",
+        "cancelled",
+      ];
+
+      if (!allowedStatuses.includes(status)) {
+        return fail(res, 400, "Invalid booking status");
+      }
+
+      const bookings = await col("bookings");
+
+      const result = await bookings.updateOne(
+        { _id: id },
+        {
+          $set: {
+            status,
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      if (!result.matchedCount) {
+        return fail(res, 404, "Booking not found");
+      }
+
+      res.json({
+        message: "Booking status updated successfully",
+        status,
+      });
+    } catch (error) {
+      console.error("Admin booking status update error:", error);
+      fail(res, 500, "Failed to update booking status");
+    }
+  }
+);
 
 // Admin Platform Settings
 
