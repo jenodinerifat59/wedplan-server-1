@@ -590,9 +590,13 @@ console.log("User Collection:", USERS_COLLECTION);
     next();
 
   } catch (error) {
-    console.error("JWT Verification Error:", error);
-    return fail(res, 401, "Invalid or expired token");
-  }
+  console.error("JWT Verification Error:", {
+    message: error.message,
+    code: error.code,
+  });
+
+  return fail(res, 401, "Invalid or expired token");
+}
 };
 
 const requireRole = (...roles) => (req, res, next) =>
@@ -1716,13 +1720,79 @@ app.delete("/api/admin/services/:id", ...adminOnly, async (req, res) => {
 });
 
 // Read-only on purpose: admins can never edit payment records
+
+// Admin Transactions - Read Only
 app.get("/api/admin/transactions", ...adminOnly, async (req, res) => {
-  const list = await (await col("transactions")).find().sort({ createdAt: -1 }).limit(500).toArray();
-  const ids = [...new Set(list.map((t) => String(t.vendorId)))].map((i) => new ObjectId(i));
-  const users = await (await col(USERS_COLLECTION)).find({ _id: { $in: ids } }).toArray();
-  const map = new Map(users.map((u) => [String(u._id), publicVendor(u)]));
-  res.json(list.map((t) => ({ ...t, vendor: map.get(String(t.vendorId)) || null })));
+  try {
+    const transactions = await (await col("transactions"))
+      .find()
+      .sort({ createdAt: -1 })
+      .limit(500)
+      .toArray();
+
+    // Collect both customer and vendor IDs safely
+    const userIds = [
+      ...new Set(
+        transactions
+          .flatMap((t) => [t.customerId, t.vendorId])
+          .filter(Boolean)
+          .map((id) => String(id))
+          .filter((id) => ObjectId.isValid(id))
+      ),
+    ].map((id) => new ObjectId(id));
+
+    // Fetch related users
+    const users = userIds.length
+      ? await (await col(USERS_COLLECTION))
+          .find({ _id: { $in: userIds } })
+          .toArray()
+      : [];
+
+    const userMap = new Map(
+      users.map((user) => [String(user._id), user])
+    );
+
+    // Attach customer/vendor information
+    const result = transactions.map((transaction) => {
+      const customer = transaction.customerId
+        ? userMap.get(String(transaction.customerId))
+        : null;
+
+      const vendor = transaction.vendorId
+        ? userMap.get(String(transaction.vendorId))
+        : null;
+
+      return {
+        ...transaction,
+
+        customer: customer
+          ? {
+              _id: customer._id,
+              name: customer.name,
+              email: customer.email,
+              image: customer.image,
+            }
+          : null,
+
+        vendor: vendor ? publicVendor(vendor) : null,
+
+        payerType: customer
+          ? "customer"
+          : vendor
+            ? "vendor"
+            : "unknown",
+      };
+    });
+
+    res.json(result);
+  } catch (error) {
+    console.error("Admin Transactions Error:", error);
+    res.status(500).json({
+      message: "Failed to load transactions",
+    });
+  }
 });
+
 
 app.get("/api/admin/bookings", ...adminOnly, async (req, res) => {
   try {
