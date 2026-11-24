@@ -605,19 +605,6 @@ const requireRole = (...roles) => (req, res, next) =>
 /* ------------------------------ Misc routes ------------------------------ */
 app.get("/", (req, res) => res.json({ message: "WedPlan API running" }));
 
-app.post("/api/upload", upload.single("image"), async (req, res) => {
-  if (!req.file) return fail(res, 400, "Image file is required");
-  if (!req.file.mimetype.startsWith("image/")) return fail(res, 400, "Only image files allowed");
-  const form = new FormData();
-  form.append("image", req.file.buffer.toString("base64"));
-  const r = await fetch(`https://api.imgbb.com/1/upload?key=${IMGBB_API_KEY}`, {
-    method: "POST",
-    body: form,
-  });
-  const data = await r.json();
-  if (!r.ok || !data?.data?.url) return fail(res, 502, "Image upload failed");
-  res.json({ url: data.data.url });
-});
 
 app.get("/api/me", verifyJWT, (req, res) => {
   const { _id, name, email, image, role, businessName, subscriptionPlan, subscriptionExpiresAt } =
